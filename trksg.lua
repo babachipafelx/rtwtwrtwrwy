@@ -7025,7 +7025,7 @@ trackKeybindConnection(safeConnect(UIS.InputChanged, function(input)
     subtitle.TextColor3 = palette.textDim
     subtitle.TextSize = 11
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
-    subtitle.Text = 'made by antihype'
+    subtitle.Text = 'made by kyousuke19999'
     subtitle.Parent = header
     subtitle.ZIndex = 2
 
