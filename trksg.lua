@@ -1,5 +1,6 @@
 Toggles = Toggles or {}
 Options = Options or {}
+BacktrackApi = BacktrackApi or {}
 
 local function installSafeDrawingWrapper()
     if type(Drawing) ~= 'table' or type(Drawing.new) ~= 'function' then
@@ -1913,23 +1914,27 @@ do
         nextAllowedShotAt = 0
     end
 
-    local function getShotIntervalForTool(toolName, userDelaySec)
-        return 0
-    end
-
     local function tryTriggerShot(currentToolName)
         local delayMs = 0
         pcall(function()
             delayMs = tonumber(Options and Options.TriggerDelay and Options.TriggerDelay.Value) or 0
         end)
         local userDelaySec = math.max(delayMs, 0) / 1000
-        local interval = getShotIntervalForTool(currentToolName, userDelaySec)
         local now = os.clock()
 
         if lastWeaponName ~= currentToolName then
             lastWeaponName = currentToolName
             nextAllowedShotAt = 0
             forceReleaseTriggerMouse()
+        end
+
+        -- Delay 0: hold LMB while the target is valid (no 10ms click pulse).
+        if userDelaySec <= 0 then
+            if not isTriggerMouseDown then
+                pcall(function() mouse1press() end)
+                isTriggerMouseDown = true
+            end
+            return
         end
 
         if now < nextAllowedShotAt then
@@ -1942,7 +1947,7 @@ do
             forceReleaseTriggerMouse()
         end)
 
-        nextAllowedShotAt = now + interval
+        nextAllowedShotAt = now + userDelaySec
     end
 
     -- Robustly rebuild TriggerWhitelist from the UI dropdown value.
@@ -2301,8 +2306,63 @@ safeConnect(RunService.RenderStepped, function()
         local isNearMiss = false
         pcall(function() target = mouse.Target end)
 
+        local fromGhost = false
+        local ghostPlayer = nil
+        pcall(function()
+            if not (BacktrackApi and BacktrackApi.isActive and BacktrackApi.isActive()) then
+                return
+            end
+            if type(BacktrackApi.resolveFromPart) ~= 'function' then
+                return
+            end
+            local gpl, live, gpart = BacktrackApi.resolveFromPart(target)
+            if not gpl or not live then
+                return
+            end
+            -- Dead ghosts already have CanQuery off; skip extra Range/LoS raycast.
+            if typeof(gpart) == 'Instance' and gpart:IsA('BasePart') and gpart.CanQuery == false then
+                return
+            end
+            local origin = nil
+            if type(BacktrackApi.muzzleOrigin) == 'function' then
+                origin = BacktrackApi.muzzleOrigin()
+            end
+            local registers = true
+            if type(BacktrackApi.wouldRegister) == 'function' then
+                registers = BacktrackApi.wouldRegister(origin, live, gpl) == true
+            end
+            if registers then
+                ghostPlayer = gpl
+                target = live
+                fromGhost = true
+                return
+            end
+            -- Ghost would not register: look through it at the live model. Do not nil target / stop fire.
+            local cam = workspace.CurrentCamera
+            if not cam then
+                return
+            end
+            local mousePos = UIS:GetMouseLocation()
+            local ray = cam:ViewportPointToRay(mousePos.X, mousePos.Y)
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            local exclude = {}
+            if LocalPlayer.Character then
+                exclude[#exclude + 1] = LocalPlayer.Character
+            end
+            local folder = workspace:FindFirstChild('BacktrackGhosts')
+            if folder then
+                exclude[#exclude + 1] = folder
+            end
+            params.FilterDescendantsInstances = exclude
+            local result = workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
+            if result and result.Instance then
+                target = result.Instance
+            end
+        end)
+
         -- Old near-miss path: only scan players when cursor is NOT already on a player.
-        if isMissFeatureActive() then
+        if (not fromGhost) and isMissFeatureActive() then
             local playerOnTarget = nil
             if target and target.Parent then
                 local modelOnTarget = target.Parent:FindFirstAncestorOfClass('Model') or target.Parent
@@ -2338,12 +2398,22 @@ safeConnect(RunService.RenderStepped, function()
 
         -- attempt to resolve the character/model and player for KO checks
         local modelInstance = parent:FindFirstAncestorOfClass('Model') or parent
-        local pl = nil
-        pcall(function()
-            if modelInstance then pl = Players:GetPlayerFromCharacter(modelInstance) end
-        end)
+        local pl = ghostPlayer
+        if not pl then
+            pcall(function()
+                if modelInstance then pl = Players:GetPlayerFromCharacter(modelInstance) end
+            end)
+        else
+            pcall(function()
+                if pl.Character then
+                    modelInstance = pl.Character
+                    parent = pl.Character
+                    humanoid = pl.Character:FindFirstChildOfClass('Humanoid') or humanoid
+                end
+            end)
+        end
 
-        if triggerMode == 'Model' then
+        if (not fromGhost) and triggerMode == 'Model' then
             local modelFits = false
             pcall(function()
                 if pl and pl.Character then
@@ -5798,6 +5868,7 @@ do
     State.ShowAutoShotInKeybinds = ensureToggle('ShowAutoShotInKeybinds', true)
     State.ShowAutoSortInKeybinds = ensureToggle('ShowAutoSortInKeybinds', true)
     State.ShowAimLockInKeybinds = ensureToggle('ShowAimLockInKeybinds', true)
+    State.ShowBacktrackInKeybinds = ensureToggle('ShowBacktrackInKeybinds', true)
     State.SpectatorListEnabled = ensureToggle('SpectatorListEnabled', false)
     State.AntiAimViewerEnabled = ensureToggle('AntiAimViewerEnabled', false)
     State.PanicMode = ensureToggle('PanicMode', false)
@@ -5874,6 +5945,15 @@ do
     State.InstaKey = ensureKeybind('InstaMacroKey', Enum.KeyCode.Insert, 'Hold', false)
     State.MenuKey = ensureKeybind('MenuKeybind', Enum.KeyCode.End, 'Hold', false)
     State.AimLock.Key = ensureKeybind('AimLockKey', Enum.UserInputType.MouseButton2, 'Hold', true)
+    State.Backtrack = {
+        Enabled = ensureToggle('BacktrackEnabled', false),
+        TargetOnly = ensureToggle('BacktrackTargetOnly', false),
+        ShowGhosts = ensureToggle('BacktrackShowGhosts', true),
+        Delay = ensureOption('BacktrackDelay', 200),
+        SilentChance = ensureOption('BacktrackSilentChance', 0),
+        Color = ensureOption('BacktrackColor', Color3.fromRGB(0, 220, 255)),
+    }
+    State.Backtrack.Key = ensureKeybind('BacktrackKey', Enum.KeyCode.Q, 'Toggle', true)
     for key, optionId in pairs(themeOptionIds) do
         State[optionId] = ensureOption(optionId, themeDefaults[key])
     end
@@ -6042,6 +6122,7 @@ do
     createKeybindListRow('AutoShot', State.AutoShotKey, State.ShowAutoShotInKeybinds)
     createKeybindListRow('AutoSort', State.InventoryAutoSortKey, State.ShowAutoSortInKeybinds)
     createKeybindListRow('pSilent', State.AimLock.Key, State.ShowAimLockInKeybinds)
+    createKeybindListRow('Backtrack', State.Backtrack.Key, State.ShowBacktrackInKeybinds)
 
     local function updateKeybindWindowSize()
         local contentHeight = keybindBodyPad.PaddingTop.Offset
@@ -6100,6 +6181,7 @@ do
     attachChangeListener(State.ShowAutoShotInKeybinds, refreshKeybindWindow)
     attachChangeListener(State.ShowAutoSortInKeybinds, refreshKeybindWindow)
     attachChangeListener(State.ShowAimLockInKeybinds, refreshKeybindWindow)
+    attachChangeListener(State.ShowBacktrackInKeybinds, refreshKeybindWindow)
     attachChangeListener(State.ShowKeybindsList, setKeybindWindowVisible)
     setKeybindWindowVisible()
     refreshKeybindWindow()
@@ -10173,6 +10255,7 @@ trackConnection(safeConnect(UIS.InputBegan, function(input)
     pages = {
         Combat = createPage('Combat'),
         pSilent = createPage('pSilent'),
+        Backtrack = createPage('Backtrack'),
         Visuals = createPage('Visuals'),
         Roles = createPage('Roles'),
         Inventory = createPage('Inventory'),
@@ -10302,6 +10385,33 @@ trackConnection(safeConnect(UIS.InputBegan, function(input)
         if silentMissShotsUi.body then
             createSlider(silentMissShotsUi.body, 'Revolver Miss Shots', State.AimLock.MissRevolverShots, 1, 6, 1, '')
             createSlider(silentMissShotsUi.body, 'Shotgun Miss Shots', State.AimLock.MissShotgunShots, 1, 3, 1, '')
+        end
+    end)()
+
+    ;(function()
+        local btSection = createSection(pages.Backtrack, 'Backtrack')
+        createToggle(btSection, 'Enable Backtrack', State.Backtrack.Enabled, 'Records delayed hitboxes')
+        createToggle(btSection, 'Target Only', State.Backtrack.TargetOnly)
+        createSlider(btSection, 'Delay (ms)', State.Backtrack.Delay, 50, 400, 1, ' ms')
+        createToggle(btSection, 'Show Ghosts', State.Backtrack.ShowGhosts)
+        createColorRow(btSection, 'Ghost Color', State.Backtrack.Color)
+        createKeybindRow(btSection, 'Backtrack Keybind', State.Backtrack.Key)
+
+        local btSilentSection = createSection(pages.Backtrack, 'Silent / Trigger')
+        createSlider(btSilentSection, 'Silent Ghost Chance (%)', State.Backtrack.SilentChance, 0, 100, 1, '%')
+        do
+            local hint = Instance.new('TextLabel')
+            hint.BackgroundTransparency = 1
+            hint.Size = UDim2.new(1, 0, 0, 28)
+            hint.Font = fonts.mono
+            hint.TextColor3 = palette.textDim
+            hint.TextSize = 9
+            hint.TextXAlignment = Enum.TextXAlignment.Left
+            hint.TextYAlignment = Enum.TextYAlignment.Top
+            hint.TextWrapped = true
+            hint.Text = 'With pSilent on and trigger held: chance to aim at a ghost in FOV only if live damage would register.'
+            hint.Parent = btSilentSection
+            bindTheme(hint, 'TextColor3', 'textDim')
         end
     end)()
 
@@ -11430,6 +11540,7 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
             createToggle(keybindPickerBody, 'AutoShot', State.ShowAutoShotInKeybinds)
             createToggle(keybindPickerBody, 'AutoSort', State.ShowAutoSortInKeybinds)
             createToggle(keybindPickerBody, 'pSilent', State.ShowAimLockInKeybinds)
+            createToggle(keybindPickerBody, 'Backtrack', State.ShowBacktrackInKeybinds)
 
             local keybindPickerOpen = false
             local function setKeybindPickerVisible(open)
@@ -11491,13 +11602,19 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
                         if not panicSaved then
                             panicSaved = {
                                 silent = State.AimLock and State.AimLock.Enabled and State.AimLock.Enabled.Value == true,
+                                backtrack = State.Backtrack and State.Backtrack.Enabled and State.Backtrack.Enabled.Value == true,
                             }
                         end
                         setToggleSafe(State.AimLock and State.AimLock.Enabled, false)
+                        setToggleSafe(State.Backtrack and State.Backtrack.Enabled, false)
+                        if BacktrackApi and type(BacktrackApi.clearAll) == 'function' then
+                            pcall(BacktrackApi.clearAll)
+                        end
                     elseif panicSaved then
                         local saved = panicSaved
                         panicSaved = nil
                         setToggleSafe(State.AimLock and State.AimLock.Enabled, saved.silent)
+                        setToggleSafe(State.Backtrack and State.Backtrack.Enabled, saved.backtrack)
                     end
                 end)
                 panicApplying = false
@@ -11522,6 +11639,9 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
             end
             if State.AimLock and State.AimLock.Enabled then
                 attachChangeListener(State.AimLock.Enabled, guardWhilePanicked)
+            end
+            if State.Backtrack and State.Backtrack.Enabled then
+                attachChangeListener(State.Backtrack.Enabled, guardWhilePanicked)
             end
             local Players = game:GetService('Players')
             local ReplicatedStorage = game:GetService('ReplicatedStorage')
@@ -12490,6 +12610,10 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
             if LocalPlayer.Character then
                 ignore[#ignore + 1] = LocalPlayer.Character
             end
+            local ghostFolder = Workspace:FindFirstChild('BacktrackGhosts')
+            if ghostFolder then
+                ignore[#ignore + 1] = ghostFolder
+            end
             params.FilterDescendantsInstances = ignore
             local result = Workspace:Raycast(origin, toTarget, params)
             if not result or not result.Instance then
@@ -12733,6 +12857,9 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
         local function resolveSilentTarget(origin)
             if not isAimFovActive() then
                 clearSilentCache()
+                if BacktrackApi and type(BacktrackApi.clearPending) == 'function' then
+                    BacktrackApi.clearPending()
+                end
                 return nil
             end
             -- Dedup getAim + packFire in the same shot (one jitter sample). Never cache a miss.
@@ -12741,6 +12868,35 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
                 return lastSilentTarget
             end
             local fov = tonumber(AimLock.FOV.Value) or 5
+
+            local ghostAim, ghostHrp, ghostPlr = nil, nil, nil
+            pcall(function()
+                if not (BacktrackApi and BacktrackApi.isActive and BacktrackApi.isActive()) then
+                    return
+                end
+                if not (BacktrackApi.peekUseGhost and BacktrackApi.peekUseGhost()) then
+                    return
+                end
+                if type(BacktrackApi.pickGhostInFov) ~= 'function' then
+                    return
+                end
+                local fovPx = degreesToScreenRadius(fov)
+                local crosshair = UserInputService:GetMouseLocation()
+                local function inFov(pos)
+                    return screenFovDist(pos, crosshair, fovPx)
+                end
+                ghostAim, ghostHrp, ghostPlr = BacktrackApi.pickGhostInFov(origin, inFov)
+            end)
+            if ghostAim and ghostPlr then
+                lockedPlayer = ghostPlr
+                lockClock = now
+                nextAcquireAt = 0
+                lastSilentTarget = ghostAim
+                lastSilentHrp = ghostHrp
+                lastSilentPlayer = ghostPlr
+                lastResolveClock = now
+                return ghostAim
+            end
             local delay = math.clamp(tonumber(AimLock.TargetSwitchDelay and AimLock.TargetSwitchDelay.Value) or 0.1, 0.1, 2)
             local closestAim, closestHrp, closestPlr = findTarget(origin, fov)
 
@@ -13122,6 +13278,12 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
                                     end
                                 end
                             end
+                            if BacktrackApi and type(BacktrackApi.consumeUseGhost) == 'function' then
+                                pcall(BacktrackApi.consumeUseGhost)
+                            end
+                            if BacktrackApi and type(BacktrackApi.snapPackedShot) == 'function' then
+                                pcall(BacktrackApi.snapPackedShot, origin, range, bulletcount, hits, ends)
+                            end
                             return prevPackFire(origin, range, bulletcount, hits, ends)
                         end
                         packFireHooked = true
@@ -13146,6 +13308,9 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
                 clearSilentCache()
                 bypassShotsLeft = 0
                 pendingSkip = nil
+                if BacktrackApi and type(BacktrackApi.clearPending) == 'function' then
+                    BacktrackApi.clearPending()
+                end
             end
             if AimLock.Enabled.Value == true and AimLock.ShowFOV.Value == true then
                 UpdateFOVCircle()
@@ -13180,11 +13345,11 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
                 end)
             end
         end)
-    end)(State.AimLock, safeConnect, Library, isSharedTargetRole, isSharedFriendRole, Toggles, Options);
+    end)(State.AimLock, safeConnect, Library, isSharedTargetRole, isSharedFriendRole, Toggles, Options)
 
+    do
     (function()
     local tabButtons = {}
-
     local function applyTabVisual(entry)
         if not entry then
             return
@@ -13321,6 +13486,7 @@ safeConnect(btn.MouseButton1Click, function()
 
     createTabButton('Combat')
     createTabButton('pSilent')
+    createTabButton('Backtrack')
     createTabButton('Visuals')
     createTabButton('Roles')
     createTabButton('Inventory')
@@ -13767,4 +13933,652 @@ trackConnection(safeConnect(UIS.InputEnded, function(input)
         end)
         end)
     end)()
+    end
+
+    do
+    (function(BT, safeConnect, Library, isSharedTargetRole, isSharedFriendRole, runLaterFn)
+        local Players = game:GetService('Players')
+        local ReplicatedStorage = game:GetService('ReplicatedStorage')
+        local RunService = game:GetService('RunService')
+        local Workspace = game:GetService('Workspace')
+        local LocalPlayer = Players.LocalPlayer
+        local FOLDER_NAME = 'BacktrackGhosts'
+        local RANGE_PAD = 2
+        local ghostMap = {}
+        local playerGhosts = {}
+        local history = {}
+        local pendingRedirects = {}
+        local pendingUseGhost = nil
+        local sendingFire = false
+        local hookedShoot = false
+        local hookedFire = false
+        local queryCacheAt = {}
+        local QUERY_REFRESH = 0.1
+
+        local function isKeyActive(optionObj)
+            if not optionObj then
+                return false
+            end
+            if type(optionObj.GetState) == 'function' then
+                local ok, state = pcall(function()
+                    return optionObj:GetState()
+                end)
+                if ok then
+                    return state == true
+                end
+            end
+            return false
+        end
+
+        local function isActive()
+            return BT and BT.Enabled and BT.Enabled.Value == true and isKeyActive(BT.Key)
+        end
+
+        local function getFolder()
+            local folder = Workspace:FindFirstChild(FOLDER_NAME)
+            if folder then
+                return folder
+            end
+            folder = Instance.new('Folder')
+            folder.Name = FOLDER_NAME
+            folder.Parent = Workspace
+            return folder
+        end
+
+        local function resolveLivePart(realHrp)
+            if not realHrp or not realHrp.Parent then
+                return nil
+            end
+            local char = realHrp.Parent
+            for _, name in ipairs({ 'UpperTorso', 'HumanoidRootPart', 'Head', 'Hitbox' }) do
+                local p = char:FindFirstChild(name)
+                if p and p:IsA('BasePart') then
+                    return p
+                end
+            end
+            return realHrp
+        end
+
+        local function muzzleOrigin()
+            local char = LocalPlayer and LocalPlayer.Character
+            if not char then
+                return nil
+            end
+            local tool = char:FindFirstChildOfClass('Tool')
+            if tool then
+                local handle = tool:FindFirstChild('Handle')
+                if tool:FindFirstChild('Default') then
+                    local mesh = tool.Default:FindFirstChild('Mesh')
+                    local def = mesh and mesh:FindFirstChild('Default')
+                    local muzzle = def and def:FindFirstChild('Muzzle')
+                    if muzzle then
+                        return muzzle.WorldPosition
+                    end
+                end
+                if handle then
+                    local muzzle = handle:FindFirstChild('Muzzle')
+                    if muzzle then
+                        return muzzle.WorldPosition
+                    end
+                    return (handle.CFrame * CFrame.new(-1, 0.4, 0)).Position
+                end
+            end
+            local hrp = char:FindFirstChild('HumanoidRootPart')
+            return hrp and hrp.Position or nil
+        end
+
+        local function equippedWeaponRange(packedRange)
+            local char = LocalPlayer and LocalPlayer.Character
+            local tool = char and char:FindFirstChildOfClass('Tool')
+            if tool then
+                local r = tool:FindFirstChild('Range')
+                if r and (r:IsA('NumberValue') or r:IsA('IntValue')) then
+                    return r.Value
+                end
+            end
+            return tonumber(packedRange) or 0
+        end
+
+        local function hasLineOfSight(origin, live)
+            if typeof(origin) ~= 'Vector3' or not live or not live.Parent then
+                return false
+            end
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            params.IgnoreWater = true
+            local exclude = {}
+            if LocalPlayer.Character then
+                exclude[#exclude + 1] = LocalPlayer.Character
+            end
+            local folder = Workspace:FindFirstChild(FOLDER_NAME)
+            if folder then
+                exclude[#exclude + 1] = folder
+            end
+            params.FilterDescendantsInstances = exclude
+            local delta = live.Position - origin
+            if delta.Magnitude < 0.05 then
+                return true
+            end
+            local result = Workspace:Raycast(origin, delta, params)
+            if not result then
+                return true
+            end
+            return result.Instance:IsDescendantOf(live.Parent)
+        end
+
+        local function isPlayerValid(plr)
+            if not plr or plr == LocalPlayer then
+                return false
+            end
+            if isSharedFriendRole(plr) then
+                return false
+            end
+            if BT.TargetOnly and BT.TargetOnly.Value == true and not isSharedTargetRole(plr) then
+                return false
+            end
+            if IsPlayerKO(plr) then
+                return false
+            end
+            local char = plr.Character
+            if not char then
+                return false
+            end
+            local hum = char:FindFirstChildOfClass('Humanoid')
+            if hum and (hum.Health or 0) <= 0 then
+                return false
+            end
+            local hrp = char:FindFirstChild('HumanoidRootPart')
+            return hrp and hrp:IsA('BasePart')
+        end
+
+        local function wouldRegister(origin, live, plr)
+            if plr and not isPlayerValid(plr) then
+                return false
+            end
+            if not live or not live.Parent then
+                return false
+            end
+            if typeof(origin) ~= 'Vector3' then
+                origin = muzzleOrigin()
+            end
+            if typeof(origin) ~= 'Vector3' then
+                return false
+            end
+            local maxRange = equippedWeaponRange(nil)
+            if maxRange <= 0 then
+                maxRange = 200
+            end
+            if (live.Position - origin).Magnitude > maxRange + RANGE_PAD then
+                return false
+            end
+            return hasLineOfSight(origin, live)
+        end
+
+        local function destroyGhost(plr)
+            local part = plr and playerGhosts[plr]
+            if part then
+                ghostMap[part] = nil
+                playerGhosts[plr] = nil
+                pcall(function()
+                    part:Destroy()
+                end)
+            end
+            if plr then
+                queryCacheAt[plr] = nil
+            end
+        end
+
+        local function clearAll()
+            for plr in pairs(playerGhosts) do
+                destroyGhost(plr)
+            end
+            for part in pairs(ghostMap) do
+                ghostMap[part] = nil
+                pcall(function()
+                    part:Destroy()
+                end)
+            end
+            history = {}
+            pendingRedirects = {}
+            pendingUseGhost = nil
+            queryCacheAt = {}
+            local folder = Workspace:FindFirstChild(FOLDER_NAME)
+            if folder then
+                folder:ClearAllChildren()
+            end
+        end
+
+        local function sampleAt(hist, targetT)
+            if not hist or #hist == 0 then
+                return nil
+            end
+            local prev = hist[1]
+            for i = 1, #hist do
+                local s = hist[i]
+                if s.t <= targetT then
+                    prev = s
+                else
+                    local span = s.t - prev.t
+                    local alpha = span > 1e-4 and math.clamp((targetT - prev.t) / span, 0, 1) or 0
+                    return {
+                        cf = prev.cf:Lerp(s.cf, alpha),
+                        size = prev.size:Lerp(s.size, alpha),
+                    }
+                end
+            end
+            return { cf = prev.cf, size = prev.size }
+        end
+
+        local function sourcePart(char)
+            local hitbox = char:FindFirstChild('Hitbox')
+            if hitbox and hitbox:IsA('BasePart') then
+                return hitbox
+            end
+            return char:FindFirstChild('HumanoidRootPart')
+        end
+
+        local function ensureGhost(plr, sample)
+            local part = playerGhosts[plr]
+            local created = false
+            if not (part and part.Parent) then
+                created = true
+                part = Instance.new('Part')
+                part.Name = 'BT_' .. plr.Name
+                part.Anchored = true
+                part.CanCollide = false
+                part.CanTouch = false
+                part.CanQuery = false
+                part.Massless = true
+                part.Transparency = 1
+                part.Material = Enum.Material.SmoothPlastic
+                part.Parent = getFolder()
+
+                local box = Instance.new('BoxHandleAdornment')
+                box.Name = 'Outline'
+                box.Adornee = part
+                box.AlwaysOnTop = true
+                box.ZIndex = 5
+                box.Parent = part
+
+                local sel = Instance.new('SelectionBox')
+                sel.Name = 'Edge'
+                sel.Adornee = part
+                sel.LineThickness = 0.03
+                sel.Parent = part
+
+                playerGhosts[plr] = part
+            end
+            local hrp = plr.Character and plr.Character:FindFirstChild('HumanoidRootPart')
+            ghostMap[part] = hrp
+            part.Size = sample.size
+            part.CFrame = sample.cf
+            local color = (BT.Color and BT.Color.Value) or Color3.fromRGB(0, 220, 255)
+            local show = BT.ShowGhosts and BT.ShowGhosts.Value == true
+            local box = part:FindFirstChild('Outline')
+            if box then
+                box.Size = part.Size
+                box.Color3 = color
+                box.Transparency = show and 0.55 or 1
+                box.Adornee = part
+            end
+            local sel = part:FindFirstChild('Edge')
+            if sel then
+                sel.Color3 = color
+                sel.Transparency = show and 0.15 or 1
+                sel.Adornee = part
+            end
+            local live = resolveLivePart(hrp)
+            local nowQ = os.clock()
+            local lastQ = queryCacheAt[plr] or 0
+            if created or (nowQ - lastQ) >= QUERY_REFRESH then
+                queryCacheAt[plr] = nowQ
+                part.CanQuery = wouldRegister(muzzleOrigin(), live, plr)
+            end
+            return part
+        end
+
+        local function pushHistory(plr, source)
+            local now = os.clock()
+            local hist = history[plr]
+            if not hist then
+                hist = {}
+                history[plr] = hist
+            end
+            hist[#hist + 1] = { t = now, cf = source.CFrame, size = source.Size }
+            local delay = math.clamp(tonumber(BT.Delay and BT.Delay.Value) or 200, 50, 400) / 1000
+            local cutoff = now - delay - 0.25
+            while #hist > 0 and hist[1].t < cutoff do
+                table.remove(hist, 1)
+            end
+            while #hist > 48 do
+                table.remove(hist, 1)
+            end
+        end
+
+        local function tickGhosts()
+            if not isActive() then
+                if next(playerGhosts) then
+                    clearAll()
+                end
+                return
+            end
+            local delay = math.clamp(tonumber(BT.Delay and BT.Delay.Value) or 200, 50, 400) / 1000
+            local now = os.clock()
+            local seen = {}
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if isPlayerValid(plr) then
+                    seen[plr] = true
+                    local source = sourcePart(plr.Character)
+                    if source and source:IsA('BasePart') then
+                        pushHistory(plr, source)
+                        local sample = sampleAt(history[plr], now - delay)
+                        if sample then
+                            ensureGhost(plr, sample)
+                        end
+                    end
+                end
+            end
+            for plr in pairs(playerGhosts) do
+                if not seen[plr] then
+                    destroyGhost(plr)
+                    history[plr] = nil
+                end
+            end
+        end
+
+        local function resolveFromPart(hit)
+            if typeof(hit) ~= 'Instance' then
+                return nil, nil, nil
+            end
+            local hrp = ghostMap[hit]
+            if not hrp and type(hit.Name) == 'string' and string.sub(hit.Name, 1, 3) == 'BT_' then
+                local plr = Players:FindFirstChild(string.sub(hit.Name, 4))
+                hrp = plr and plr.Character and plr.Character:FindFirstChild('HumanoidRootPart')
+            end
+            if not hrp or not hrp.Parent then
+                return nil, nil, nil
+            end
+            local plr = Players:GetPlayerFromCharacter(hrp.Parent)
+            return plr, resolveLivePart(hrp), hit
+        end
+
+        local function peekUseGhost()
+            if pendingUseGhost ~= nil then
+                return pendingUseGhost
+            end
+            if not isActive() then
+                pendingUseGhost = false
+                return false
+            end
+            local chance = math.clamp(tonumber(BT.SilentChance and BT.SilentChance.Value) or 0, 0, 100)
+            if chance <= 0 then
+                pendingUseGhost = false
+                return false
+            end
+            pendingUseGhost = math.random(1, 100) <= chance
+            return pendingUseGhost
+        end
+
+        local function consumeUseGhost()
+            local v = peekUseGhost()
+            pendingUseGhost = nil
+            return v
+        end
+
+        local function clearPending()
+            pendingUseGhost = nil
+        end
+
+        local function pickGhostInFov(origin, inFovFn)
+            if not isActive() then
+                return nil, nil, nil
+            end
+            if typeof(origin) ~= 'Vector3' then
+                return nil, nil, nil
+            end
+            local bestDist, bestAim, bestHrp, bestPlr = math.huge, nil, nil, nil
+            for plr, part in pairs(playerGhosts) do
+                if part and part.Parent and isPlayerValid(plr) then
+                    local live = resolveLivePart(ghostMap[part] or (plr.Character and plr.Character:FindFirstChild('HumanoidRootPart')))
+                    if live and wouldRegister(origin, live, plr) then
+                        local dist, inFov = inFovFn(part.Position)
+                        if inFov and dist and dist < bestDist then
+                            bestDist = dist
+                            bestAim = part.Position
+                            bestHrp = ghostMap[part]
+                            bestPlr = plr
+                        end
+                    end
+                end
+            end
+            return bestAim, bestHrp, bestPlr
+        end
+
+        local function snapPackedShot(origin, range, count, hits, ends)
+            local n = math.max(tonumber(count) or 0, #pendingRedirects)
+            if hits then
+                n = math.max(n, #hits)
+            end
+            for i = 1, n do
+                local entry = pendingRedirects[i]
+                local live = type(entry) == 'table' and entry.live or nil
+                local forceMiss = type(entry) == 'table' and entry.miss == true
+                if not live and hits and typeof(hits[i]) == 'Vector3' then
+                    for part, hrp in pairs(ghostMap) do
+                        if part.Parent and (part.Position - hits[i]).Magnitude < math.max(part.Size.Magnitude * 0.6, 4) then
+                            live = resolveLivePart(hrp)
+                            break
+                        end
+                    end
+                end
+                if forceMiss or not wouldRegister(origin, live, nil) then
+                    continue
+                end
+                local livePos = live.Position
+                if hits then
+                    hits[i] = livePos
+                end
+                if ends then
+                    ends[i] = livePos
+                end
+            end
+        end
+
+        local function applyRedirects(origin, range, count, hits, ends, hitInstances)
+            local changed = false
+            count = tonumber(count) or (hits and #hits) or 0
+            local n = math.max(count, #pendingRedirects)
+            if hitInstances then
+                n = math.max(n, #hitInstances)
+            end
+            for i = 1, n do
+                local entry = pendingRedirects[i]
+                local live = type(entry) == 'table' and entry.live or nil
+                local forceMiss = type(entry) == 'table' and entry.miss == true
+                local isGhost = hitInstances and typeof(hitInstances[i]) == 'Instance' and ghostMap[hitInstances[i]] ~= nil
+                if not live and isGhost then
+                    local _, resolved = resolveFromPart(hitInstances[i])
+                    live = resolved
+                end
+                if not entry and not isGhost then
+                    continue
+                end
+                if forceMiss or not wouldRegister(origin, live, nil) then
+                    if hitInstances then
+                        hitInstances[i] = nil
+                    end
+                    changed = true
+                    continue
+                end
+                local livePos = live.Position
+                if hitInstances then
+                    hitInstances[i] = live
+                end
+                if hits then
+                    hits[i] = livePos
+                end
+                if ends then
+                    ends[i] = livePos
+                end
+                changed = true
+            end
+            return changed
+        end
+
+        local function setupHooks()
+            local Modules = ReplicatedStorage:FindFirstChild('Modules')
+            if not Modules then
+                return
+            end
+            local GunModuleInst = Modules:FindFirstChild('GunModule')
+            local GunNetInst = Modules:FindFirstChild('GunNet')
+            if GunModuleInst and not hookedShoot then
+                pcall(function()
+                    local GunModule = require(GunModuleInst)
+                    if type(GunModule) ~= 'table' or type(GunModule.shoot) ~= 'function' then
+                        return
+                    end
+                    local oldShoot = GunModule.shoot
+                    local wrap = function(args)
+                        local results = table.pack(oldShoot(args))
+                        local hitInst = results[2]
+                        local plr, live = resolveFromPart(hitInst)
+                        if not live then
+                            return table.unpack(results, 1, results.n)
+                        end
+                        local origin = nil
+                        if type(args) == 'table' then
+                            origin = args.ForcedOrigin
+                            if typeof(origin) ~= 'Vector3' and args.Handle and args.Handle.Parent then
+                                origin = args.Handle.Position
+                            end
+                        end
+                        if wouldRegister(origin, live, plr) then
+                            results[2] = live
+                            results[1] = live.Position
+                            table.insert(pendingRedirects, { live = live })
+                        else
+                            table.insert(pendingRedirects, { miss = true })
+                        end
+                        return table.unpack(results, 1, results.n)
+                    end
+                    if type(hookfunction) == 'function' then
+                        oldShoot = hookfunction(GunModule.shoot, wrap)
+                    else
+                        GunModule.shoot = wrap
+                    end
+                    hookedShoot = true
+                end)
+            end
+            if not GunNetInst then
+                return
+            end
+            pcall(function()
+                local GunNet = require(GunNetInst)
+                if type(GunNet) ~= 'table' then
+                    return
+                end
+                local gunFire = type(GunNet.getFireRemote) == 'function' and GunNet.getFireRemote() or nil
+                if gunFire and not hookedFire then
+                    local function patchOutgoingFire(packed, hitInstances)
+                        local unpacked = typeof(packed) == 'buffer' and type(GunNet.unpackFire) == 'function' and GunNet.unpackFire(packed) or nil
+                        if not unpacked then
+                            if type(hitInstances) == 'table' then
+                                for i, hit in pairs(hitInstances) do
+                                    local entry = pendingRedirects[i]
+                                    if ghostMap[hit] or (type(entry) == 'table' and (entry.miss or entry.live)) then
+                                        hitInstances[i] = nil
+                                    end
+                                end
+                            end
+                            pendingRedirects = {}
+                            return packed, hitInstances
+                        end
+                        local did = applyRedirects(
+                            unpacked.origin,
+                            unpacked.range,
+                            unpacked.bulletcount,
+                            unpacked.hits,
+                            unpacked.ends,
+                            hitInstances
+                        )
+                        if did and type(GunNet.packFire) == 'function' then
+                            packed = GunNet.packFire(
+                                unpacked.origin,
+                                unpacked.range,
+                                unpacked.bulletcount,
+                                unpacked.hits,
+                                unpacked.ends
+                            )
+                        end
+                        pendingRedirects = {}
+                        return packed, hitInstances
+                    end
+
+                    local function fireGun(invoke, self, packed, hitInstances, effect)
+                        if sendingFire then
+                            return invoke(self, packed, hitInstances, effect)
+                        end
+                        sendingFire = true
+                        local okPatch, err = pcall(function()
+                            packed, hitInstances = patchOutgoingFire(packed, hitInstances)
+                        end)
+                        if not okPatch then
+                            sendingFire = false
+                            error(err)
+                        end
+                        local results = table.pack(pcall(invoke, self, packed, hitInstances, effect))
+                        sendingFire = false
+                        if not results[1] then
+                            error(results[2])
+                        end
+                        return table.unpack(results, 2, results.n)
+                    end
+
+                    if type(hookfunction) == 'function' then
+                        local oldFireServer = gunFire.FireServer
+                        hookfunction(gunFire.FireServer, function(self, packed, hitInstances, effect)
+                            return fireGun(oldFireServer, self, packed, hitInstances, effect)
+                        end)
+                    end
+                    hookedFire = true
+                end
+            end)
+        end
+
+        BacktrackApi.isActive = isActive
+        BacktrackApi.muzzleOrigin = muzzleOrigin
+        BacktrackApi.wouldRegister = wouldRegister
+        BacktrackApi.resolveFromPart = resolveFromPart
+        BacktrackApi.pickGhostInFov = pickGhostInFov
+        BacktrackApi.peekUseGhost = peekUseGhost
+        BacktrackApi.consumeUseGhost = consumeUseGhost
+        BacktrackApi.clearPending = clearPending
+        BacktrackApi.snapPackedShot = snapPackedShot
+        BacktrackApi.clearAll = clearAll
+        BacktrackApi.ghostMap = ghostMap
+
+        safeConnect(RunService.Heartbeat, function()
+            if not hookedShoot or not hookedFire then
+                setupHooks()
+            end
+            tickGhosts()
+        end)
+        safeConnect(Players.PlayerRemoving, function(plr)
+            destroyGhost(plr)
+            history[plr] = nil
+        end)
+        if Library and type(Library.OnUnload) == 'function' then
+            Library:OnUnload(function()
+                clearAll()
+            end)
+        end
+
+        if type(runLaterFn) == 'function' then
+            runLaterFn(0, setupHooks)
+        else
+            setupHooks()
+        end
+    end)(State.Backtrack, safeConnect, Library, isSharedTargetRole, isSharedFriendRole, runLater)
+    end
 end
