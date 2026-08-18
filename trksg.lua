@@ -13272,7 +13272,9 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
                             if BacktrackApi and type(BacktrackApi.consumeUseGhost) == 'function' then
                                 pcall(BacktrackApi.consumeUseGhost)
                             end
-                            if BacktrackApi and type(BacktrackApi.snapPackedShot) == 'function' then
+                            local btActive = BacktrackApi and BacktrackApi.isActive and BacktrackApi.isActive()
+                            local hasGhost = BacktrackApi and BacktrackApi.hasPendingRedirects and BacktrackApi.hasPendingRedirects()
+                            if btActive and hasGhost and type(BacktrackApi.snapPackedShot) == 'function' then
                                 pcall(BacktrackApi.snapPackedShot, origin, range, bulletcount, hits, ends)
                             end
                             return prevPackFire(origin, range, bulletcount, hits, ends)
@@ -14346,31 +14348,27 @@ trackConnection(safeConnect(UIS.InputEnded, function(input)
         end
 
         local function snapPackedShot(origin, range, count, hits, ends)
+            if not pendingRedirects or #pendingRedirects < 1 then
+                return
+            end
             local n = math.max(tonumber(count) or 0, #pendingRedirects)
             if hits then
                 n = math.max(n, #hits)
             end
+            local pelletCount = math.max(1, math.floor(tonumber(count) or n))
             for i = 1, n do
                 local entry = pendingRedirects[i]
                 local live = type(entry) == 'table' and entry.live or nil
                 local forceMiss = type(entry) == 'table' and entry.miss == true
-                if not live and hits and typeof(hits[i]) == 'Vector3' then
-                    for part, hrp in pairs(ghostMap) do
-                        if part.Parent and (part.Position - hits[i]).Magnitude < math.max(part.Size.Magnitude * 0.6, 4) then
-                            live = resolveLivePart(hrp)
-                            break
-                        end
-                    end
-                end
                 if forceMiss or not wouldRegister(origin, live, nil) then
                     continue
                 end
-                local livePos = live.Position
+                -- Shotgun ends stay near-muzzle unique; never collapse all pellets to live.Position.
                 if hits then
-                    hits[i] = livePos
+                    hits[i] = live.Position
                 end
-                if ends then
-                    ends[i] = livePos
+                if pelletCount <= 1 and ends then
+                    ends[i] = live.Position
                 end
             end
         end
@@ -14382,6 +14380,7 @@ trackConnection(safeConnect(UIS.InputEnded, function(input)
             if hitInstances then
                 n = math.max(n, #hitInstances)
             end
+            local pelletCount = math.max(1, math.floor(count > 0 and count or n))
             for i = 1, n do
                 local entry = pendingRedirects[i]
                 local live = type(entry) == 'table' and entry.live or nil
@@ -14401,15 +14400,15 @@ trackConnection(safeConnect(UIS.InputEnded, function(input)
                     changed = true
                     continue
                 end
-                local livePos = live.Position
                 if hitInstances then
                     hitInstances[i] = live
                 end
                 if hits then
-                    hits[i] = livePos
+                    hits[i] = live.Position
                 end
-                if ends then
-                    ends[i] = livePos
+                -- Single pellet can snap end; shotgun keeps unique near-muzzle ends.
+                if pelletCount <= 1 and ends then
+                    ends[i] = live.Position
                 end
                 changed = true
             end
@@ -14545,6 +14544,9 @@ trackConnection(safeConnect(UIS.InputEnded, function(input)
         BacktrackApi.peekUseGhost = peekUseGhost
         BacktrackApi.consumeUseGhost = consumeUseGhost
         BacktrackApi.clearPending = clearPending
+        BacktrackApi.hasPendingRedirects = function()
+            return type(pendingRedirects) == 'table' and #pendingRedirects > 0
+        end
         BacktrackApi.snapPackedShot = snapPackedShot
         BacktrackApi.clearAll = clearAll
         BacktrackApi.ghostMap = ghostMap
