@@ -1928,15 +1928,6 @@ do
             forceReleaseTriggerMouse()
         end
 
-        -- Delay 0: hold LMB while the target is valid (no 10ms click pulse).
-        if userDelaySec <= 0 then
-            if not isTriggerMouseDown then
-                pcall(function() mouse1press() end)
-                isTriggerMouseDown = true
-            end
-            return
-        end
-
         if now < nextAllowedShotAt then
             return
         end
