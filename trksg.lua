@@ -11559,6 +11559,10 @@ if Options.TriggerWhitelist and type(Options.TriggerWhitelist.SetValue) == 'func
             applyTheme()
         end)
         loadConfigRow.LayoutOrder = 8
+        local unloadRow = createButton(generalSection, 'Unload', function()
+            Library:Unload()
+        end)
+        unloadRow.LayoutOrder = 9
 
         -- Spectator detector (admin spectate) - standalone mini GUI
         -- Panic Mode: while admin spectates you, force-off pSilent
